@@ -33,7 +33,7 @@ rand = "0.8.5"
 lazy_static = "1.4.0"
 bincode = "1.3.3"
 systemstat = "0.2.3"
-hidapi = { version = "2.4.1", default-features = false, features = ["linux-native"] }
+hidapi = { version = "2.4.1", default-features = false, features = ["linux-static-hidraw"] }
 serde-big-array = "0.5.1"
 clap = { version = "4.4.13", features = ["derive"] }
 gtk = "0.18.1"
