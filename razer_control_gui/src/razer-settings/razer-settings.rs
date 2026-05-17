@@ -7,7 +7,7 @@ use gtk::{
     ComboBoxText, Button, ColorButton, LinkButton
 };
 use gtk::{glib, glib::clone};
-        
+
 // sudo apt install libgdk-pixbuf2.0-dev libcairo-dev libatk1.0-dev
 // sudo apt install libpango1.0-dev
 
@@ -16,6 +16,7 @@ mod comms;
 mod error_handling;
 mod widgets;
 mod util;
+mod curve_editor;
 
 use service::SupportedDevice;
 use error_handling::*;
@@ -270,6 +271,83 @@ fn set_fan_speed(ac: bool, value: i32) -> Option<bool> {
     }
 }
 
+pub fn get_fan_mode(ac: bool) -> Option<comms::FanMode> {
+    let ac = if ac { 1 } else { 0 };
+    let response = send_data(comms::DaemonCommand::GetFanMode { ac })?;
+    use comms::DaemonResponse::*;
+    match response {
+        GetFanMode { mode } => Some(mode),
+        response => {
+            println!("Instead of GetFanMode got {response:?}");
+            None
+        }
+    }
+}
+
+pub fn set_fan_mode(ac: bool, mode: comms::FanMode) -> Option<bool> {
+    let ac = if ac { 1 } else { 0 };
+    let response = send_data(comms::DaemonCommand::SetFanMode { ac, mode })?;
+    use comms::DaemonResponse::*;
+    match response {
+        SetFanMode { result } => Some(result),
+        response => {
+            println!("Instead of SetFanMode got {response:?}");
+            None
+        }
+    }
+}
+
+pub fn get_fan_curve(ac: bool, sensor: comms::Sensor) -> Option<Vec<comms::CurvePoint>> {
+    let ac = if ac { 1 } else { 0 };
+    let response = send_data(comms::DaemonCommand::GetFanCurve { ac, sensor })?;
+    use comms::DaemonResponse::*;
+    match response {
+        GetFanCurve { points } => Some(points),
+        response => {
+            println!("Instead of GetFanCurve got {response:?}");
+            None
+        }
+    }
+}
+
+pub fn set_fan_curve(ac: bool, sensor: comms::Sensor, points: Vec<comms::CurvePoint>) -> Option<bool> {
+    let ac = if ac { 1 } else { 0 };
+    let response = send_data(comms::DaemonCommand::SetFanCurve { ac, sensor, points })?;
+    use comms::DaemonResponse::*;
+    match response {
+        SetFanCurve { result } => Some(result),
+        response => {
+            println!("Instead of SetFanCurve got {response:?}");
+            None
+        }
+    }
+}
+
+pub fn get_temps() -> Option<(Option<f32>, Option<f32>, u16)> {
+    let response = send_data(comms::DaemonCommand::GetTemps)?;
+    use comms::DaemonResponse::*;
+    match response {
+        GetTemps { cpu, gpu, target_rpm } => Some((cpu, gpu, target_rpm)),
+        response => {
+            println!("Instead of GetTemps got {response:?}");
+            None
+        }
+    }
+}
+
+fn refresh_temp_label(label: &Label) {
+    let Some((cpu, gpu, target)) = get_temps() else {
+        return;
+    };
+    let fmt = |t: Option<f32>| -> String {
+        t.map(|v| format!("{:.1}°C", v)).unwrap_or_else(|| "--".to_string())
+    };
+    label.set_text(&format!(
+        "CPU: {}   GPU: {}   Target: {} RPM",
+        fmt(cpu), fmt(gpu), target
+    ));
+}
+
 fn main() {
     setup_panic_hook();
     gtk::init().or_crash("Failed to initialize GTK.");
@@ -496,39 +574,87 @@ fn make_page(ac: bool, device: SupportedDevice) -> SettingsPage {
         ));
     }
 
-    // Fan Speed Section
-    let settings_section = settings_page.add_section(Some("Fan Speed"));
-        let label = Label::new(Some("Auto"));
-        let switch = Switch::new();
-        let auto = fan_speed == 0;
-        switch.set_state(auto);
-    let row = SettingsRow::new(&label, &switch);
+    // Fan Control Section
+    let settings_section = settings_page.add_section(Some("Fan Control"));
+
+    // Live temperature readout (refreshed every second)
+    let temp_label = Label::new(Some("CPU: --   GPU: --   Target: -- RPM"));
+    temp_label.set_xalign(0.0);
+    let row = SettingsRow::new(&Label::new(Some("Temperatures")), &temp_label);
     settings_section.add_row(&row.master_container);
-        let label = Label::new(Some("Fan Speed"));
-        let scale = Scale::with_range(gtk::Orientation::Horizontal, min_fan_speed, max_fan_speed, 1f64);
-        scale.set_value(fan_speed as f64);
-        scale.set_sensitive(fan_speed != 0);
-        scale.set_width_request(100);
-        scale.connect_change_value(clone!(@weak switch => @default-return gtk::glib::Propagation::Stop, move |scale, stype, value| {
-            let value = value.clamp(min_fan_speed, max_fan_speed);
-            set_fan_speed(ac, value as i32).or_crash("Error setting fan speed");
-            let fan_speed = get_fan_speed(ac).or_crash("Error reading fan speed");
-            let auto = fan_speed == 0;
-            scale.set_value(fan_speed as f64);
-            scale.set_sensitive(!auto);
-            switch.set_state(auto);
-            return gtk::glib::Propagation::Stop;
-        }));
-        switch.connect_changed_active(clone!(@weak scale => move |switch| {
-            set_fan_speed(ac, if switch.is_active() { 0 } else { min_fan_speed as i32 }).or_crash("Error setting fan speed");
-            let fan_speed = get_fan_speed(ac).or_crash("Error reading fan speed");
-            let auto = fan_speed == 0;
-            scale.set_value(fan_speed as f64);
-            scale.set_sensitive(!auto);
-            switch.set_state(auto);
-        }));
-    let row = SettingsRow::new(&label, &scale);
+
+    refresh_temp_label(&temp_label);
+    let weak_label = temp_label.downgrade();
+    glib::timeout_add_seconds_local(1, move || {
+        match weak_label.upgrade() {
+            Some(label) => {
+                refresh_temp_label(&label);
+                glib::ControlFlow::Continue
+            }
+            None => glib::ControlFlow::Break,
+        }
+    });
+
+    // Mode selector
+    let initial_mode = get_fan_mode(ac).unwrap_or_default();
+    let mode_label = Label::new(Some("Mode"));
+    let mode_combo = ComboBoxText::new();
+    mode_combo.append_text("Firmware (let EC decide)");
+    mode_combo.append_text("Curve (daemon controlled)");
+    mode_combo.append_text("Manual (fixed RPM)");
+    mode_combo.set_active(Some(match initial_mode {
+        comms::FanMode::Firmware => 0,
+        comms::FanMode::Curve => 1,
+        comms::FanMode::Manual => 2,
+    }));
+    mode_combo.set_width_request(180);
+    let row = SettingsRow::new(&mode_label, &mode_combo);
     settings_section.add_row(&row.master_container);
+
+    // Manual RPM Scale (sensitive only in Manual mode)
+    let manual_label = Label::new(Some("Manual RPM"));
+    let manual_scale = Scale::with_range(gtk::Orientation::Horizontal, min_fan_speed, max_fan_speed, 1f64);
+    let manual_initial = if fan_speed == 0 { min_fan_speed as i32 } else { fan_speed };
+    manual_scale.set_value(manual_initial as f64);
+    manual_scale.set_width_request(120);
+    manual_scale.set_sensitive(initial_mode == comms::FanMode::Manual);
+    let row = SettingsRow::new(&manual_label, &manual_scale);
+    settings_section.add_row(&row.master_container);
+
+    manual_scale.connect_change_value(move |scale, _stype, value| {
+        let value = value.clamp(min_fan_speed, max_fan_speed);
+        set_fan_speed(ac, value as i32).or_crash("Error setting fan speed");
+        scale.set_value(value);
+        gtk::glib::Propagation::Stop
+    });
+
+    // CPU and GPU curve editors (sensitive only in Curve mode)
+    let cpu_initial = get_fan_curve(ac, comms::Sensor::Cpu).unwrap_or_default();
+    let gpu_initial = get_fan_curve(ac, comms::Sensor::Gpu).unwrap_or_default();
+    let fan_range_f = (min_fan_speed, max_fan_speed);
+    let cpu_editor = curve_editor::make_curve_editor(ac, comms::Sensor::Cpu, fan_range_f, cpu_initial);
+    let gpu_editor = curve_editor::make_curve_editor(ac, comms::Sensor::Gpu, fan_range_f, gpu_initial);
+    let curve_active = initial_mode == comms::FanMode::Curve;
+    cpu_editor.container.set_sensitive(curve_active);
+    gpu_editor.container.set_sensitive(curve_active);
+    settings_section.add_row(&cpu_editor.container);
+    settings_section.add_row(&gpu_editor.container);
+
+    let cpu_container = cpu_editor.container.clone();
+    let gpu_container = gpu_editor.container.clone();
+    mode_combo.connect_changed(clone!(@weak manual_scale, @weak cpu_container, @weak gpu_container => move |combo| {
+        let new_mode = match combo.active() {
+            Some(0) => comms::FanMode::Firmware,
+            Some(1) => comms::FanMode::Curve,
+            Some(2) => comms::FanMode::Manual,
+            _ => return,
+        };
+        set_fan_mode(ac, new_mode).or_crash("Error setting fan mode");
+        manual_scale.set_sensitive(new_mode == comms::FanMode::Manual);
+        let curve_active = new_mode == comms::FanMode::Curve;
+        cpu_container.set_sensitive(curve_active);
+        gpu_container.set_sensitive(curve_active);
+    }));
 
     // Keyboard Section
     let settings_section = settings_page.add_section(Some("Keyboard"));

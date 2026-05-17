@@ -2,10 +2,38 @@ use serde::{Deserialize, Serialize};
 use std::{fs, fs::File, io, env};
 use std::io::prelude::*;
 
+use crate::comms::{CurvePoint, FanMode};
+
 const SETTINGS_FILE: &str = "/.local/share/razercontrol/daemon.json";
 const EFFECTS_FILE: &str = "/.local/share/razercontrol/effects.json";
 
-#[derive(Serialize, Deserialize, Copy, Clone)]
+pub fn default_cpu_curve() -> Vec<CurvePoint> {
+    vec![
+        CurvePoint { temp_c: 40, rpm: 3500 },
+        CurvePoint { temp_c: 55, rpm: 3800 },
+        CurvePoint { temp_c: 70, rpm: 4400 },
+        CurvePoint { temp_c: 85, rpm: 5000 },
+    ]
+}
+
+pub fn default_gpu_curve() -> Vec<CurvePoint> {
+    vec![
+        CurvePoint { temp_c: 45, rpm: 3500 },
+        CurvePoint { temp_c: 60, rpm: 3800 },
+        CurvePoint { temp_c: 75, rpm: 4400 },
+        CurvePoint { temp_c: 85, rpm: 5000 },
+    ]
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct FanCurve {
+    #[serde(default)]
+    pub cpu: Vec<CurvePoint>,
+    #[serde(default)]
+    pub gpu: Vec<CurvePoint>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct PowerConfig {
     pub power_mode: u8,
     pub cpu_boost: u8,
@@ -15,6 +43,10 @@ pub struct PowerConfig {
     pub logo_state: u8,
     pub screensaver: bool, // turno of keyboard light if screen is blank
     pub idle: u32,
+    #[serde(default)]
+    pub fan_mode: FanMode,
+    #[serde(default)]
+    pub fan_curve: FanCurve,
 }
 
 impl PowerConfig {
@@ -28,6 +60,11 @@ impl PowerConfig {
             logo_state: 0,
             screensaver: false,
             idle: 0,
+            fan_mode: FanMode::Curve,
+            fan_curve: FanCurve {
+                cpu: default_cpu_curve(),
+                gpu: default_gpu_curve(),
+            },
         }
     }
 }
@@ -60,7 +97,15 @@ impl Configuration {
 
     pub fn read_from_config() -> io::Result<Configuration> {
         let str = fs::read_to_string(get_home_directory() + SETTINGS_FILE)?;
-        let res: Configuration = serde_json::from_str(str.as_str())?;
+        let mut res: Configuration = serde_json::from_str(str.as_str())?;
+        for slot in res.power.iter_mut() {
+            if slot.fan_curve.cpu.is_empty() {
+                slot.fan_curve.cpu = default_cpu_curve();
+            }
+            if slot.fan_curve.gpu.is_empty() {
+                slot.fan_curve.gpu = default_gpu_curve();
+            }
+        }
         Ok(res)
     }
 

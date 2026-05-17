@@ -5,6 +5,34 @@ use std::os::unix::net::{UnixListener, UnixStream};
 /// Razer laptop control socket path
 pub const SOCKET_PATH: &str = "/tmp/razercontrol-socket";
 
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum FanMode {
+    /// Daemon leaves fan control to the laptop firmware (legacy "auto").
+    Firmware,
+    /// Daemon polls temperatures and drives RPM via a user-defined curve.
+    Curve,
+    /// Daemon writes a fixed user-set RPM and does not adjust it.
+    Manual,
+}
+
+impl Default for FanMode {
+    fn default() -> Self {
+        FanMode::Curve
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Sensor {
+    Cpu,
+    Gpu,
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct CurvePoint {
+    pub temp_c: u8,
+    pub rpm: u16,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 /// Represents data sent TO the daemon
 pub enum DaemonCommand {
@@ -26,7 +54,13 @@ pub enum DaemonCommand {
     GetSync (),
     SetBatteryHealthOptimizer { is_on: bool, threshold: u8 },
     GetBatteryHealthOptimizer (),
-    GetDeviceName 
+    GetDeviceName,
+    // --- Fan curve / temperature feature (appended only; do not reorder) ---
+    SetFanMode { ac: usize, mode: FanMode },
+    GetFanMode { ac: usize },
+    SetFanCurve { ac: usize, sensor: Sensor, points: Vec<CurvePoint> },
+    GetFanCurve { ac: usize, sensor: Sensor },
+    GetTemps,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -51,7 +85,13 @@ pub enum DaemonResponse {
     GetSync { sync: bool },
     SetBatteryHealthOptimizer { result: bool },
     GetBatteryHealthOptimizer { is_on: bool, threshold: u8 },
-    GetDeviceName { name: String }
+    GetDeviceName { name: String },
+    // --- Fan curve / temperature feature (appended only; do not reorder) ---
+    SetFanMode { result: bool },
+    GetFanMode { mode: FanMode },
+    SetFanCurve { result: bool },
+    GetFanCurve { points: Vec<CurvePoint> },
+    GetTemps { cpu: Option<f32>, gpu: Option<f32>, target_rpm: u16 },
 }
 
 #[allow(dead_code)]

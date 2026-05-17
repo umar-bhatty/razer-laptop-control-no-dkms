@@ -59,6 +59,12 @@ enum ReadAttr {
     Sync,
     /// Read the current bho mode
     Bho,
+    /// Read the current fan mode (firmware/curve/manual)
+    FanMode(AcStateParam),
+    /// Read the fan curve points for a sensor
+    Curve(CurveReadParams),
+    /// Read the latest CPU/GPU temperatures the daemon has sampled
+    Temps,
 }
 
 #[derive(Subcommand)]
@@ -75,6 +81,10 @@ enum WriteAttr {
     Sync(SyncParams),
     /// Set battery health optimization
     Bho(BhoParams),
+    /// Set the fan mode (firmware/curve/manual)
+    FanMode(FanModeParams),
+    /// Set the fan curve points for a sensor: "<temp>:<rpm>,<temp>:<rpm>,..."
+    Curve(CurveWriteParams),
 }
 
 #[derive(Parser)]
@@ -137,6 +147,77 @@ enum AcState {
 struct AcStateParam {
     /// battery/plugged in
     ac_state: AcState,
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum FanModeArg {
+    /// EC firmware drives the fan (legacy behavior)
+    Firmware,
+    /// Daemon polls temperatures and drives the fan via a curve
+    Curve,
+    /// Daemon writes a fixed RPM and leaves it
+    Manual,
+}
+
+impl From<FanModeArg> for comms::FanMode {
+    fn from(m: FanModeArg) -> Self {
+        match m {
+            FanModeArg::Firmware => comms::FanMode::Firmware,
+            FanModeArg::Curve => comms::FanMode::Curve,
+            FanModeArg::Manual => comms::FanMode::Manual,
+        }
+    }
+}
+
+impl FanModeArg {
+    fn describe(m: comms::FanMode) -> &'static str {
+        match m {
+            comms::FanMode::Firmware => "firmware",
+            comms::FanMode::Curve => "curve",
+            comms::FanMode::Manual => "manual",
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum SensorArg {
+    Cpu,
+    Gpu,
+}
+
+impl From<SensorArg> for comms::Sensor {
+    fn from(s: SensorArg) -> Self {
+        match s {
+            SensorArg::Cpu => comms::Sensor::Cpu,
+            SensorArg::Gpu => comms::Sensor::Gpu,
+        }
+    }
+}
+
+#[derive(Parser)]
+struct FanModeParams {
+    /// battery/plugged in
+    ac_state: AcState,
+    /// firmware | curve | manual
+    mode: FanModeArg,
+}
+
+#[derive(Parser)]
+struct CurveReadParams {
+    /// battery/plugged in
+    ac_state: AcState,
+    /// cpu | gpu
+    sensor: SensorArg,
+}
+
+#[derive(Parser)]
+struct CurveWriteParams {
+    /// battery/plugged in
+    ac_state: AcState,
+    /// cpu | gpu
+    sensor: SensorArg,
+    /// Curve points: "<temp_c>:<rpm>,<temp_c>:<rpm>,..." e.g. "40:3500,70:4400,85:5000"
+    points: String,
 }
 
 #[derive(Subcommand)]
@@ -284,6 +365,11 @@ fn main() {
             ReadAttr::Logo(AcStateParam { ac_state }) => read_logo_mode(ac_state as usize),
             ReadAttr::Sync => read_sync(),
             ReadAttr::Bho => read_bho(),
+            ReadAttr::FanMode(AcStateParam { ac_state }) => read_fan_mode(ac_state as usize),
+            ReadAttr::Curve(CurveReadParams { ac_state, sensor }) => {
+                read_fan_curve(ac_state as usize, sensor.into())
+            }
+            ReadAttr::Temps => read_temps(),
         },
         Args::Write { attr } => match attr {
             WriteAttr::Fan(FanParams { ac_state, speed }) => {
@@ -306,6 +392,12 @@ fn main() {
             }) => write_logo_mode(ac_state as usize, logo_state as u8),
             WriteAttr::Bho(BhoParams { state, threshold }) => {
                 validate_and_write_bho(threshold, state)
+            }
+            WriteAttr::FanMode(FanModeParams { ac_state, mode }) => {
+                write_fan_mode(ac_state as usize, mode.into())
+            }
+            WriteAttr::Curve(CurveWriteParams { ac_state, sensor, points }) => {
+                write_fan_curve(ac_state as usize, sensor.into(), &points)
             }
         },
         Args::Effect { effect } => match effect {
@@ -710,5 +802,145 @@ fn write_sync(sync: bool) {
     match send_data(comms::DaemonCommand::SetSync { sync }) {
         Some(_) => read_sync(),
         None => eprintln!("Unknown error!"),
+    }
+}
+
+fn read_fan_mode(ac: usize) {
+    match send_data(comms::DaemonCommand::GetFanMode { ac }) {
+        Some(comms::DaemonResponse::GetFanMode { mode }) => {
+            println!("Current fan mode: {}", FanModeArg::describe(mode));
+        }
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("Unknown daemon error!"),
+    }
+}
+
+fn write_fan_mode(ac: usize, mode: comms::FanMode) {
+    match send_data(comms::DaemonCommand::SetFanMode { ac, mode }) {
+        Some(_) => read_fan_mode(ac),
+        None => eprintln!("Unknown error!"),
+    }
+}
+
+fn read_fan_curve(ac: usize, sensor: comms::Sensor) {
+    match send_data(comms::DaemonCommand::GetFanCurve { ac, sensor }) {
+        Some(comms::DaemonResponse::GetFanCurve { points }) => {
+            let label = match sensor {
+                comms::Sensor::Cpu => "CPU",
+                comms::Sensor::Gpu => "GPU",
+            };
+            let rendered: Vec<String> = points
+                .iter()
+                .map(|p| format!("{}:{}", p.temp_c, p.rpm))
+                .collect();
+            println!("{} curve: {}", label, rendered.join(","));
+        }
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("Unknown daemon error!"),
+    }
+}
+
+fn write_fan_curve(ac: usize, sensor: comms::Sensor, raw: &str) {
+    let points = match parse_curve(raw) {
+        Ok(p) => p,
+        Err(e) => {
+            Cli::command()
+                .error(ErrorKind::InvalidValue, format!("invalid curve: {e}"))
+                .exit();
+        }
+    };
+    match send_data(comms::DaemonCommand::SetFanCurve { ac, sensor, points }) {
+        Some(_) => read_fan_curve(ac, sensor),
+        None => eprintln!("Unknown error!"),
+    }
+}
+
+fn read_temps() {
+    match send_data(comms::DaemonCommand::GetTemps) {
+        Some(comms::DaemonResponse::GetTemps { cpu, gpu, target_rpm }) => {
+            let fmt = |t: Option<f32>| -> String {
+                t.map(|v| format!("{:.1}°C", v)).unwrap_or_else(|| "n/a".to_string())
+            };
+            println!(
+                "CPU: {}   GPU: {}   Target: {} RPM",
+                fmt(cpu),
+                fmt(gpu),
+                target_rpm
+            );
+        }
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("Unknown daemon error!"),
+    }
+}
+
+fn parse_curve(raw: &str) -> Result<Vec<comms::CurvePoint>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("curve cannot be empty".to_string());
+    }
+    let mut out = Vec::new();
+    let mut prev_temp: Option<u8> = None;
+    for (i, segment) in trimmed.split(',').enumerate() {
+        let segment = segment.trim();
+        let (t, r) = segment
+            .split_once(':')
+            .ok_or_else(|| format!("point #{} missing ':' (got '{}')", i + 1, segment))?;
+        let temp_c: u8 = t.trim().parse()
+            .map_err(|_| format!("point #{} temperature is not an integer 0-255 (got '{}')", i + 1, t))?;
+        let rpm: u16 = r.trim().parse()
+            .map_err(|_| format!("point #{} rpm is not an integer 0-65535 (got '{}')", i + 1, r))?;
+        if let Some(prev) = prev_temp {
+            if temp_c <= prev {
+                return Err(format!(
+                    "point #{} temperature ({}) must be strictly greater than previous ({})",
+                    i + 1, temp_c, prev
+                ));
+            }
+        }
+        prev_temp = Some(temp_c);
+        out.push(comms::CurvePoint { temp_c, rpm });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_well_formed_curve() {
+        let pts = parse_curve("40:3500,55:3800,70:4400,85:5000").unwrap();
+        assert_eq!(pts.len(), 4);
+        assert_eq!(pts[0].temp_c, 40);
+        assert_eq!(pts[0].rpm, 3500);
+        assert_eq!(pts[3].temp_c, 85);
+        assert_eq!(pts[3].rpm, 5000);
+    }
+
+    #[test]
+    fn tolerates_whitespace() {
+        let pts = parse_curve(" 40 : 3500 , 70 : 5000 ").unwrap();
+        assert_eq!(pts.len(), 2);
+        assert_eq!(pts[1].temp_c, 70);
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(parse_curve("").is_err());
+        assert!(parse_curve("   ").is_err());
+    }
+
+    #[test]
+    fn rejects_non_monotonic_temperatures() {
+        assert!(parse_curve("70:3500,55:4000").is_err());
+        assert!(parse_curve("70:3500,70:4000").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_segments() {
+        assert!(parse_curve("40-3500").is_err());
+        assert!(parse_curve("40:").is_err());
+        assert!(parse_curve(":3500").is_err());
+        assert!(parse_curve("abc:3500").is_err());
     }
 }

@@ -181,7 +181,7 @@ impl DeviceManager {
 
     fn get_ac_config(&mut self, ac: usize) -> Option<config::PowerConfig> {
         if let Some(c) = self.get_config() {
-            return Some(c.power[ac]);
+            return Some(c.power[ac].clone());
         }
 
         return None;
@@ -290,11 +290,14 @@ impl DeviceManager {
         let mut res: bool = false;
         if let Some(config) = self.get_config() {
             config.power[ac].fan_rpm = rpm;
+            // A user-initiated RPM write implies Manual mode; otherwise the curve
+            // controller would immediately overwrite the value.
+            config.power[ac].fan_mode = crate::comms::FanMode::Manual;
             if let Err(e) = config.write_to_file() {
                 eprintln!("Error write config {:?}", e);
             }
         }
-             
+
         if let Some(laptop) = self.get_device() {
             let state = laptop.get_ac_state();
             if state != ac {
@@ -305,6 +308,86 @@ impl DeviceManager {
         }
 
         return res;
+    }
+
+    pub fn set_fan_mode(&mut self, ac: usize, mode: crate::comms::FanMode) -> bool {
+        let mut stored_manual_rpm: i32 = 0;
+        if let Some(config) = self.get_config() {
+            config.power[ac].fan_mode = mode;
+            stored_manual_rpm = config.power[ac].fan_rpm;
+            if let Err(e) = config.write_to_file() {
+                eprintln!("Error write config {:?}", e);
+            }
+        }
+
+        if let Some(laptop) = self.get_device() {
+            if laptop.get_ac_state() == ac {
+                match mode {
+                    crate::comms::FanMode::Firmware => {
+                        // Release fan control back to the EC.
+                        laptop.set_fan_rpm(0);
+                    }
+                    crate::comms::FanMode::Manual => {
+                        laptop.set_fan_rpm(stored_manual_rpm as u16);
+                    }
+                    crate::comms::FanMode::Curve => {
+                        // Controller thread will catch up next tick.
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    pub fn get_fan_mode(&mut self, ac: usize) -> crate::comms::FanMode {
+        self.get_ac_config(ac)
+            .map(|c| c.fan_mode)
+            .unwrap_or_default()
+    }
+
+    pub fn set_fan_curve(&mut self, ac: usize, sensor: crate::comms::Sensor, points: Vec<crate::comms::CurvePoint>) -> bool {
+        if let Some(config) = self.get_config() {
+            match sensor {
+                crate::comms::Sensor::Cpu => config.power[ac].fan_curve.cpu = points,
+                crate::comms::Sensor::Gpu => config.power[ac].fan_curve.gpu = points,
+            }
+            if let Err(e) = config.write_to_file() {
+                eprintln!("Error write config {:?}", e);
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn get_fan_curve(&mut self, ac: usize, sensor: crate::comms::Sensor) -> Vec<crate::comms::CurvePoint> {
+        match self.get_ac_config(ac) {
+            Some(c) => match sensor {
+                crate::comms::Sensor::Cpu => c.fan_curve.cpu,
+                crate::comms::Sensor::Gpu => c.fan_curve.gpu,
+            },
+            None => vec![],
+        }
+    }
+
+    /// Applies a curve-driven RPM target. Does NOT persist to disk and does NOT
+    /// touch `config.power[ac].fan_rpm`, so the user's manual setpoint survives a
+    /// `Curve → Manual` toggle. Bypasses the power-mode 4 guard via `force_fan_rpm`.
+    pub fn apply_curve_rpm(&mut self, value: u16) -> bool {
+        if let Some(laptop) = self.get_device() {
+            return laptop.force_fan_rpm(value);
+        }
+        false
+    }
+
+    /// Returns the active AC index (0 = battery, 1 = AC) from the laptop's current state.
+    pub fn get_active_ac(&mut self) -> Option<usize> {
+        self.get_device().map(|l| l.get_ac_state())
+    }
+
+    /// Returns the device's advertised fan RPM range.
+    pub fn get_fan_range(&mut self) -> Option<(u16, u16)> {
+        self.get_device().map(|l| l.get_fan_range())
     }
 
     pub fn set_logo_led_state(&mut self, ac:usize, logo_state: u8) -> bool {
@@ -818,28 +901,46 @@ impl RazerLaptop {
 
     pub fn set_fan_rpm(&mut self, value: u16) -> bool {
         if self.power != 4 {
-            match value == 0 {
-                true => self.fan_rpm = value as u8,
-                false => self.fan_rpm = self.clamp_fan(value),
-            }
-            self.get_power_mode(0x01);
-            self.set_power(0x01);
-            if value != 0 {
-                self.set_rpm(0x01);
-            }
-            self.get_power_mode(0x02);
-            self.set_power(0x02);
-            if value != 0 {
-                self.set_rpm(0x02);
-            }
+            self.drive_fan_rpm(value);
         }
 
         return true;
     }
 
+    /// Bypasses the `power != 4` guard. Used by the fan curve controller, which
+    /// must keep adjusting fans regardless of the user-selected power profile.
+    pub fn force_fan_rpm(&mut self, value: u16) -> bool {
+        self.drive_fan_rpm(value);
+        return true;
+    }
+
+    fn drive_fan_rpm(&mut self, value: u16) {
+        match value == 0 {
+            true => self.fan_rpm = value as u8,
+            false => self.fan_rpm = self.clamp_fan(value),
+        }
+        self.get_power_mode(0x01);
+        self.set_power(0x01);
+        if value != 0 {
+            self.set_rpm(0x01);
+        }
+        self.get_power_mode(0x02);
+        self.set_power(0x02);
+        if value != 0 {
+            self.set_rpm(0x02);
+        }
+    }
+
     pub fn get_fan_rpm(&mut self) -> u16 {
         let res: u16 = self.fan_rpm as u16;
         return res * 100;
+    }
+
+    /// Returns the device's advertised (min, max) fan RPM range from laptops.json.
+    pub fn get_fan_range(&self) -> (u16, u16) {
+        let lo = self.fan.first().copied().unwrap_or(0);
+        let hi = self.fan.get(1).copied().unwrap_or(lo);
+        (lo, hi)
     }
 
     pub fn set_logo_led_state(&mut self, mode: u8) -> bool {

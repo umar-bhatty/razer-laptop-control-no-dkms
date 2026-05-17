@@ -21,6 +21,8 @@ mod dbus_mutter_displayconfig;
 mod dbus_mutter_idlemonitor;
 mod screensaver;
 mod login1;
+mod thermal;
+mod fan_controller;
 
 use crate::kbd::Effect;
 
@@ -32,7 +34,7 @@ lazy_static! {
             // Err(_) => Mutex::new(config::Configuration::new()),
         // }
     // };
-    static ref DEV_MANAGER: Mutex<device::DeviceManager> = {
+    pub static ref DEV_MANAGER: Mutex<device::DeviceManager> = {
         match device::DeviceManager::read_laptops_file() {
             Ok(c) => Mutex::new(c),
             Err(_) => Mutex::new(device::DeviceManager::new()),
@@ -87,6 +89,7 @@ fn main() {
     start_keyboard_animator_task();
     start_screensaver_monitor_task();
     start_battery_monitor_task();
+    fan_controller::start_fan_controller_task();
     let clean_thread = start_shutdown_task();
 
     if let Some(listener) = comms::create() {
@@ -406,7 +409,26 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 };
                 return Some(comms::DaemonResponse::GetDeviceName { name });
             }
-
+            comms::DaemonCommand::SetFanMode { ac, mode } => {
+                Some(comms::DaemonResponse::SetFanMode { result: d.set_fan_mode(ac, mode) })
+            }
+            comms::DaemonCommand::GetFanMode { ac } => {
+                Some(comms::DaemonResponse::GetFanMode { mode: d.get_fan_mode(ac) })
+            }
+            comms::DaemonCommand::SetFanCurve { ac, sensor, points } => {
+                Some(comms::DaemonResponse::SetFanCurve { result: d.set_fan_curve(ac, sensor, points) })
+            }
+            comms::DaemonCommand::GetFanCurve { ac, sensor } => {
+                Some(comms::DaemonResponse::GetFanCurve { points: d.get_fan_curve(ac, sensor) })
+            }
+            comms::DaemonCommand::GetTemps => {
+                let snap = fan_controller::TEMP_CACHE.lock().map(|g| *g).unwrap_or_default();
+                Some(comms::DaemonResponse::GetTemps {
+                    cpu: snap.cpu,
+                    gpu: snap.gpu,
+                    target_rpm: snap.target_rpm,
+                })
+            }
         };
     } else {
         return None;
