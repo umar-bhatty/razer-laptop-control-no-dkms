@@ -91,7 +91,17 @@ pub enum DaemonResponse {
     GetFanMode { mode: FanMode },
     SetFanCurve { result: bool },
     GetFanCurve { points: Vec<CurvePoint> },
-    GetTemps { cpu: Option<f32>, gpu: Option<f32>, target_rpm: u16 },
+    GetTemps {
+        cpu: Option<f32>,
+        gpu: Option<f32>,
+        target_rpm: u16,
+        current_rpm: Option<u16>,
+        pkg_watts: Option<f32>,
+        gpu_watts: Option<f32>,
+        pkg_pl1_w: Option<u32>,
+        pkg_pl2_w: Option<u32>,
+        gpu_tgp_w: Option<u32>,
+    },
 }
 
 #[allow(dead_code)]

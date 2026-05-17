@@ -857,15 +857,34 @@ fn write_fan_curve(ac: usize, sensor: comms::Sensor, raw: &str) {
 
 fn read_temps() {
     match send_data(comms::DaemonCommand::GetTemps) {
-        Some(comms::DaemonResponse::GetTemps { cpu, gpu, target_rpm }) => {
-            let fmt = |t: Option<f32>| -> String {
+        Some(comms::DaemonResponse::GetTemps {
+            cpu, gpu, target_rpm, current_rpm,
+            pkg_watts, gpu_watts, pkg_pl1_w, pkg_pl2_w, gpu_tgp_w,
+        }) => {
+            let temp = |t: Option<f32>| -> String {
                 t.map(|v| format!("{:.1}°C", v)).unwrap_or_else(|| "n/a".to_string())
             };
+            let cur = current_rpm
+                .map(|r| format!("{} RPM", r))
+                .unwrap_or_else(|| "n/a".to_string());
+            let w = |v: Option<f32>| -> String {
+                v.map(|x| format!("{:.1}W", x)).unwrap_or_else(|| "n/a".to_string())
+            };
+            let limit_pair = |a: Option<u32>, b: Option<u32>| -> String {
+                match (a, b) {
+                    (Some(a), Some(b)) => format!("{}/{}W", a, b),
+                    _ => "n/a".to_string(),
+                }
+            };
+            let tgp = gpu_tgp_w.map(|v| format!("{}W", v)).unwrap_or_else(|| "n/a".to_string());
             println!(
-                "CPU: {}   GPU: {}   Target: {} RPM",
-                fmt(cpu),
-                fmt(gpu),
-                target_rpm
+                "CPU: {}   GPU: {}   Current: {}   Target: {} RPM",
+                temp(cpu), temp(gpu), cur, target_rpm
+            );
+            println!(
+                "Pkg: {} (PL1/PL2 {})   GPU: {} (TGP {})",
+                w(pkg_watts), limit_pair(pkg_pl1_w, pkg_pl2_w),
+                w(gpu_watts), tgp
             );
         }
         Some(_) => eprintln!("Daemon responded with invalid data!"),

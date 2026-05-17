@@ -931,9 +931,21 @@ impl RazerLaptop {
         }
     }
 
+    /// Reads the EC's current fan setpoint via the 0x0d 0x81 companion of the
+    /// set-RPM command. This is the value the EC is actually targeting — in
+    /// firmware/auto mode it reflects what the EC chose on its own (which can
+    /// be below the user-accessible range), in user mode it reflects the last
+    /// accepted setpoint (clamped/floored by the EC if our request was out of
+    /// spec). Falls back to the cached commanded RPM if the EC read fails.
     pub fn get_fan_rpm(&mut self) -> u16 {
-        let res: u16 = self.fan_rpm as u16;
-        return res * 100;
+        let mut report: RazerPacket = RazerPacket::new(0x0d, 0x81, 0x03);
+        report.args[0] = 0x00;
+        report.args[1] = 0x01;
+        report.args[2] = 0x00;
+        if let Some(resp) = self.send_report(report) {
+            return resp.args[2] as u16 * 100;
+        }
+        self.fan_rpm as u16 * 100
     }
 
     /// Returns the device's advertised (min, max) fan RPM range from laptops.json.

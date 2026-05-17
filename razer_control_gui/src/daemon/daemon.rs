@@ -427,6 +427,12 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                     cpu: snap.cpu,
                     gpu: snap.gpu,
                     target_rpm: snap.target_rpm,
+                    current_rpm: snap.current_rpm,
+                    pkg_watts: snap.pkg_watts,
+                    gpu_watts: snap.gpu_watts,
+                    pkg_pl1_w: snap.pkg_pl1_w,
+                    pkg_pl2_w: snap.pkg_pl2_w,
+                    gpu_tgp_w: snap.gpu_tgp_w,
                 })
             }
         };

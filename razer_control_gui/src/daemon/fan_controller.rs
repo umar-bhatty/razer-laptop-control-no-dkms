@@ -21,6 +21,18 @@ pub struct TempSnapshot {
     pub cpu: Option<f32>,
     pub gpu: Option<f32>,
     pub target_rpm: u16,
+    /// EC-reported current fan setpoint, sampled each tick. `None` until the
+    /// first successful read.
+    pub current_rpm: Option<u16>,
+    /// CPU package power in watts (RAPL energy diff).
+    pub pkg_watts: Option<f32>,
+    /// GPU power in watts (NVML).
+    pub gpu_watts: Option<f32>,
+    /// Configured CPU PL1 / PL2 limits in watts, from sysfs (cached at probe).
+    pub pkg_pl1_w: Option<u32>,
+    pub pkg_pl2_w: Option<u32>,
+    /// GPU enforced power limit (TGP) in watts, from NVML (cached at probe).
+    pub gpu_tgp_w: Option<u32>,
 }
 
 lazy_static! {
@@ -45,13 +57,21 @@ fn tick() {
     // Phase 1: snapshot state under the device-manager lock, then drop it.
     let Some(snapshot) = snapshot_state() else { return };
 
-    // Phase 2: read sensors (no locks held).
-    let (cpu_temp, gpu_temp) = {
-        let monitor = match THERMAL.lock() {
+    // Phase 2: read sensors and power (no other locks held).
+    let (cpu_temp, gpu_temp, pkg_watts, gpu_watts, pkg_pl1_w, pkg_pl2_w, gpu_tgp_w) = {
+        let mut monitor = match THERMAL.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        (monitor.read_cpu(), monitor.read_gpu())
+        (
+            monitor.read_cpu(),
+            monitor.read_gpu(),
+            monitor.read_pkg_watts(),
+            monitor.read_gpu_watts(),
+            monitor.pkg_pl1_w(),
+            monitor.pkg_pl2_w(),
+            monitor.gpu_tgp_w(),
+        )
     };
 
     // Phase 3: evaluate curve and decide on a target RPM.
@@ -65,40 +85,53 @@ fn tick() {
         cache.cpu = cpu_temp;
         cache.gpu = gpu_temp;
         cache.target_rpm = target;
+        cache.pkg_watts = pkg_watts;
+        cache.gpu_watts = gpu_watts;
+        cache.pkg_pl1_w = pkg_pl1_w;
+        cache.pkg_pl2_w = pkg_pl2_w;
+        cache.gpu_tgp_w = gpu_tgp_w;
     }
 
-    if snapshot.mode != FanMode::Curve {
-        return;
-    }
+    // Phase 5: ramp-limit and bucket to hardware granularity (only meaningful
+    // when we'll actually write a curve target this tick).
+    let bucketed = if snapshot.mode == FanMode::Curve {
+        Some(bucket(ramp_limit(target)))
+    } else {
+        None
+    };
 
-    // Phase 5: ramp-limit and bucket to hardware granularity.
-    let limited = ramp_limit(target);
-    let bucketed = bucket(limited);
-
-    // Phase 6: write under the lock, but re-check the mode in case a CLI flipped it
-    // mid-tick.
+    // Phase 6: acquire device lock. Used both for the curve write (if applicable)
+    // and the EC fan-RPM sample below.
     let mut dev_manager = match crate::DEV_MANAGER.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
-    let still_curve = dev_manager
-        .get_active_ac()
-        .map(|ac| dev_manager.get_fan_mode(ac) == FanMode::Curve)
-        .unwrap_or(false);
-    if !still_curve {
-        return;
+
+    // Phase 6a: write the curve target, re-checking the mode in case a CLI
+    // flipped it mid-tick.
+    if let Some(bucketed) = bucketed {
+        let still_curve = dev_manager
+            .get_active_ac()
+            .map(|ac| dev_manager.get_fan_mode(ac) == FanMode::Curve)
+            .unwrap_or(false);
+        if still_curve {
+            let mut last = LAST_WRITTEN.lock().unwrap();
+            if Some(bucketed) != *last && dev_manager.apply_curve_rpm(bucketed) {
+                debug!(
+                    "fan_controller: target={} bucketed={} cpu={:?} gpu={:?}",
+                    target, bucketed, cpu_temp, gpu_temp
+                );
+                *last = Some(bucketed);
+            }
+        }
     }
 
-    let mut last = LAST_WRITTEN.lock().unwrap();
-    if Some(bucketed) == *last {
-        return;
-    }
-    if dev_manager.apply_curve_rpm(bucketed) {
-        debug!(
-            "fan_controller: target={} bucketed={} cpu={:?} gpu={:?}",
-            target, bucketed, cpu_temp, gpu_temp
-        );
-        *last = Some(bucketed);
+    // Phase 7: sample the EC's current fan setpoint and stash it for GetTemps.
+    if let Some(ac) = dev_manager.get_active_ac() {
+        let live_rpm = dev_manager.get_fan_rpm(ac);
+        if let Ok(mut cache) = TEMP_CACHE.lock() {
+            cache.current_rpm = (live_rpm >= 0).then_some(live_rpm as u16);
+        }
     }
 }
 

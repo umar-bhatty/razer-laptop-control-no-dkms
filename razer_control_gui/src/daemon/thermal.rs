@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use log::{info, warn};
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
@@ -8,6 +9,7 @@ use nvml_wrapper::Nvml;
 use crate::comms::CurvePoint;
 
 const HWMON_ROOT: &str = "/sys/class/hwmon";
+const RAPL_ROOT: &str = "/sys/class/powercap/intel-rapl:0";
 
 const CPU_HWMON_NAMES: &[&str] = &["k10temp", "zenpower", "coretemp", "k8temp"];
 const GPU_HWMON_NAMES: &[&str] = &["amdgpu", "i915", "xe", "nouveau"];
@@ -16,6 +18,16 @@ pub struct ThermalMonitor {
     cpu_hwmon: Option<PathBuf>,
     gpu_hwmon: Option<PathBuf>,
     nvml: Option<Nvml>,
+    /// RAPL package-0 energy counter, sampled on each `read_pkg_watts` call.
+    pkg_energy_path: Option<PathBuf>,
+    prev_pkg_sample: Option<(u64, Instant)>,
+    /// Configured CPU package limits, in watts. Read once at probe time; the
+    /// kernel populates sysfs from MSR_PKG_POWER_LIMIT at boot and may not
+    /// re-read live, so a per-tick poll wouldn't help anyway.
+    pkg_pl1_w: Option<u32>,
+    pkg_pl2_w: Option<u32>,
+    /// NVML-reported GPU enforced power limit (TGP) in watts. Read once at probe.
+    gpu_tgp_w: Option<u32>,
 }
 
 impl ThermalMonitor {
@@ -62,7 +74,35 @@ impl ThermalMonitor {
             warn!("thermal: no GPU sensor detected (NVML failed and no hwmon match)");
         }
 
-        ThermalMonitor { cpu_hwmon, gpu_hwmon, nvml }
+        let pkg_energy_path = {
+            let p = Path::new(RAPL_ROOT).join("energy_uj");
+            if p.exists() {
+                info!("thermal: CPU package energy via RAPL at {}", p.display());
+                Some(p)
+            } else {
+                warn!("thermal: no RAPL package counter at {}", p.display());
+                None
+            }
+        };
+        let pkg_pl1_w = read_uw_to_w(&Path::new(RAPL_ROOT).join("constraint_0_power_limit_uw"));
+        let pkg_pl2_w = read_uw_to_w(&Path::new(RAPL_ROOT).join("constraint_1_power_limit_uw"));
+
+        let gpu_tgp_w = nvml.as_ref().and_then(|n| {
+            let dev = n.device_by_index(0).ok()?;
+            let mw = dev.enforced_power_limit().ok()?;
+            Some(mw.div_ceil(1000))
+        });
+
+        ThermalMonitor {
+            cpu_hwmon,
+            gpu_hwmon,
+            nvml,
+            pkg_energy_path,
+            prev_pkg_sample: None,
+            pkg_pl1_w,
+            pkg_pl2_w,
+            gpu_tgp_w,
+        }
     }
 
     pub fn read_cpu(&self) -> Option<f32> {
@@ -79,6 +119,40 @@ impl ThermalMonitor {
         }
         read_hwmon_temp(self.gpu_hwmon.as_ref()?)
     }
+
+    /// Returns instantaneous package power in watts, computed by diffing the
+    /// RAPL energy counter against the previous sample. `None` until the
+    /// second call (no baseline on the first one).
+    pub fn read_pkg_watts(&mut self) -> Option<f32> {
+        let path = self.pkg_energy_path.as_ref()?;
+        let s = fs::read_to_string(path).ok()?;
+        let energy_uj: u64 = s.trim().parse().ok()?;
+        let now = Instant::now();
+        let prev = self.prev_pkg_sample.replace((energy_uj, now))?;
+        let dt = now.duration_since(prev.1).as_secs_f32();
+        if dt <= 0.0 {
+            return None;
+        }
+        let de = energy_uj.wrapping_sub(prev.0) as f32 / 1e6;
+        Some(de / dt)
+    }
+
+    pub fn read_gpu_watts(&self) -> Option<f32> {
+        let nvml = self.nvml.as_ref()?;
+        let dev = nvml.device_by_index(0).ok()?;
+        let mw = dev.power_usage().ok()?;
+        Some(mw as f32 / 1000.0)
+    }
+
+    pub fn pkg_pl1_w(&self) -> Option<u32> { self.pkg_pl1_w }
+    pub fn pkg_pl2_w(&self) -> Option<u32> { self.pkg_pl2_w }
+    pub fn gpu_tgp_w(&self) -> Option<u32> { self.gpu_tgp_w }
+}
+
+fn read_uw_to_w(path: &Path) -> Option<u32> {
+    let s = fs::read_to_string(path).ok()?;
+    let uw: u64 = s.trim().parse().ok()?;
+    Some((uw / 1_000_000) as u32)
 }
 
 fn read_hwmon_temp(path: &PathBuf) -> Option<f32> {

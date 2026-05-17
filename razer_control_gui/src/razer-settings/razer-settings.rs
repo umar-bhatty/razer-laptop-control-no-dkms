@@ -323,11 +323,30 @@ pub fn set_fan_curve(ac: bool, sensor: comms::Sensor, points: Vec<comms::CurvePo
     }
 }
 
-pub fn get_temps() -> Option<(Option<f32>, Option<f32>, u16)> {
+#[derive(Default, Clone, Copy)]
+pub struct StatsSnapshot {
+    pub cpu_c: Option<f32>,
+    pub gpu_c: Option<f32>,
+    pub target_rpm: u16,
+    pub current_rpm: Option<u16>,
+    pub pkg_watts: Option<f32>,
+    pub gpu_watts: Option<f32>,
+    pub pkg_pl1_w: Option<u32>,
+    pub pkg_pl2_w: Option<u32>,
+    pub gpu_tgp_w: Option<u32>,
+}
+
+pub fn get_temps() -> Option<StatsSnapshot> {
     let response = send_data(comms::DaemonCommand::GetTemps)?;
     use comms::DaemonResponse::*;
     match response {
-        GetTemps { cpu, gpu, target_rpm } => Some((cpu, gpu, target_rpm)),
+        GetTemps {
+            cpu, gpu, target_rpm, current_rpm,
+            pkg_watts, gpu_watts, pkg_pl1_w, pkg_pl2_w, gpu_tgp_w,
+        } => Some(StatsSnapshot {
+            cpu_c: cpu, gpu_c: gpu, target_rpm, current_rpm,
+            pkg_watts, gpu_watts, pkg_pl1_w, pkg_pl2_w, gpu_tgp_w,
+        }),
         response => {
             println!("Instead of GetTemps got {response:?}");
             None
@@ -336,15 +355,16 @@ pub fn get_temps() -> Option<(Option<f32>, Option<f32>, u16)> {
 }
 
 fn refresh_temp_label(label: &Label) {
-    let Some((cpu, gpu, target)) = get_temps() else {
-        return;
-    };
+    let Some(s) = get_temps() else { return };
     let fmt = |t: Option<f32>| -> String {
         t.map(|v| format!("{:.1}°C", v)).unwrap_or_else(|| "--".to_string())
     };
+    let cur = s.current_rpm
+        .map(|r| format!("{} RPM", r))
+        .unwrap_or_else(|| "--".to_string());
     label.set_text(&format!(
-        "CPU: {}   GPU: {}   Target: {} RPM",
-        fmt(cpu), fmt(gpu), target
+        "CPU: {}   GPU: {}   Current: {}   Target: {} RPM",
+        fmt(s.cpu_c), fmt(s.gpu_c), cur, s.target_rpm
     ));
 }
 
@@ -381,6 +401,7 @@ fn main() {
 
         let ac_settings_page = make_page(true, device.clone());
         let battery_settings_page = make_page(false, device.clone());
+        let stats_page = make_stats_page();
         let general_page = make_general_page();
         let about_page = make_about_page(device.clone());
 
@@ -389,6 +410,7 @@ fn main() {
 
         stack.add_titled(&ac_settings_page.master_container, "AC", "AC");
         stack.add_titled(&battery_settings_page.master_container, "Battery", "Battery");
+        stack.add_titled(&stats_page.master_container, "Stats", "Stats");
         stack.add_titled(&general_page.master_container, "General", "General");
         stack.add_titled(&about_page.master_container, "About", "About");
 
@@ -673,6 +695,158 @@ fn make_page(ac: bool, device: SupportedDevice) -> SettingsPage {
     settings_section.add_row(&row.master_container);
 
     settings_page
+}
+
+fn make_stats_page() -> SettingsPage {
+    let page = SettingsPage::new();
+
+    // Temperatures
+    let temp_section = page.add_section(Some("Temperatures"));
+    let cpu_temp_label = Label::new(Some("--"));
+    cpu_temp_label.set_xalign(0.0);
+    temp_section.add_row(&SettingsRow::new(&Label::new(Some("CPU")), &cpu_temp_label).master_container);
+    let gpu_temp_label = Label::new(Some("--"));
+    gpu_temp_label.set_xalign(0.0);
+    temp_section.add_row(&SettingsRow::new(&Label::new(Some("GPU")), &gpu_temp_label).master_container);
+
+    // Fans
+    let fan_section = page.add_section(Some("Fans"));
+    let cur_rpm_label = Label::new(Some("--"));
+    cur_rpm_label.set_xalign(0.0);
+    fan_section.add_row(&SettingsRow::new(&Label::new(Some("Current RPM (EC)")), &cur_rpm_label).master_container);
+    let tgt_rpm_label = Label::new(Some("--"));
+    tgt_rpm_label.set_xalign(0.0);
+    fan_section.add_row(&SettingsRow::new(&Label::new(Some("Target RPM (curve)")), &tgt_rpm_label).master_container);
+
+    // Power
+    let power_section = page.add_section(Some("Power"));
+
+    // Profile selector — applies to whichever rail (AC/battery) is currently
+    // active. Picking Custom here just sets boosts to Low; refine those on
+    // the AC/Battery tabs if you need them.
+    let on_ac = check_if_running_on_ac_power().unwrap_or(true);
+    let current_profile = get_power(on_ac).unwrap_or((0, 0, 0));
+    let profile_combo = ComboBoxText::new();
+    for label in ["Balanced", "Gaming", "Creator", "Silent", "Custom"] {
+        profile_combo.append_text(label);
+    }
+    profile_combo.set_active(Some(current_profile.0 as u32));
+    profile_combo.set_width_request(120);
+    profile_combo.connect_changed(move |combo| {
+        let on_ac = check_if_running_on_ac_power().unwrap_or(true);
+        let Some(mode) = combo.active() else { return };
+        let existing = get_power(on_ac).unwrap_or((0, 0, 0));
+        // Preserve current boost values for Custom mode; ignored for 0..=3.
+        set_power(on_ac, (mode as u8, existing.1, existing.2));
+    });
+    power_section.add_row(&SettingsRow::new(&Label::new(Some("Profile")), &profile_combo).master_container);
+
+    let pkg_w_label = Label::new(Some("--"));
+    pkg_w_label.set_xalign(0.0);
+    power_section.add_row(&SettingsRow::new(&Label::new(Some("CPU package")), &pkg_w_label).master_container);
+    let pkg_lim_label = Label::new(Some("--"));
+    pkg_lim_label.set_xalign(0.0);
+    power_section.add_row(&SettingsRow::new(&Label::new(Some("CPU PL1 / PL2")), &pkg_lim_label).master_container);
+    let gpu_w_label = Label::new(Some("--"));
+    gpu_w_label.set_xalign(0.0);
+    power_section.add_row(&SettingsRow::new(&Label::new(Some("GPU")), &gpu_w_label).master_container);
+    let tgp_label = Label::new(Some("--"));
+    tgp_label.set_xalign(0.0);
+    power_section.add_row(&SettingsRow::new(&Label::new(Some("GPU TGP")), &tgp_label).master_container);
+
+    let labels = StatsLabels {
+        cpu_temp: cpu_temp_label,
+        gpu_temp: gpu_temp_label,
+        cur_rpm: cur_rpm_label,
+        tgt_rpm: tgt_rpm_label,
+        pkg_w: pkg_w_label,
+        pkg_lim: pkg_lim_label,
+        gpu_w: gpu_w_label,
+        tgp: tgp_label,
+    };
+    refresh_stats(&labels);
+    let weak = labels.downgrade();
+    glib::timeout_add_seconds_local(1, move || {
+        match weak.upgrade() {
+            Some(l) => { refresh_stats(&l); glib::ControlFlow::Continue }
+            None => glib::ControlFlow::Break,
+        }
+    });
+
+    page
+}
+
+struct StatsLabels {
+    cpu_temp: Label,
+    gpu_temp: Label,
+    cur_rpm: Label,
+    tgt_rpm: Label,
+    pkg_w: Label,
+    pkg_lim: Label,
+    gpu_w: Label,
+    tgp: Label,
+}
+
+struct StatsLabelsWeak {
+    cpu_temp: glib::WeakRef<Label>,
+    gpu_temp: glib::WeakRef<Label>,
+    cur_rpm: glib::WeakRef<Label>,
+    tgt_rpm: glib::WeakRef<Label>,
+    pkg_w: glib::WeakRef<Label>,
+    pkg_lim: glib::WeakRef<Label>,
+    gpu_w: glib::WeakRef<Label>,
+    tgp: glib::WeakRef<Label>,
+}
+
+impl StatsLabels {
+    fn downgrade(&self) -> StatsLabelsWeak {
+        StatsLabelsWeak {
+            cpu_temp: self.cpu_temp.downgrade(),
+            gpu_temp: self.gpu_temp.downgrade(),
+            cur_rpm: self.cur_rpm.downgrade(),
+            tgt_rpm: self.tgt_rpm.downgrade(),
+            pkg_w: self.pkg_w.downgrade(),
+            pkg_lim: self.pkg_lim.downgrade(),
+            gpu_w: self.gpu_w.downgrade(),
+            tgp: self.tgp.downgrade(),
+        }
+    }
+}
+
+impl StatsLabelsWeak {
+    fn upgrade(&self) -> Option<StatsLabels> {
+        Some(StatsLabels {
+            cpu_temp: self.cpu_temp.upgrade()?,
+            gpu_temp: self.gpu_temp.upgrade()?,
+            cur_rpm: self.cur_rpm.upgrade()?,
+            tgt_rpm: self.tgt_rpm.upgrade()?,
+            pkg_w: self.pkg_w.upgrade()?,
+            pkg_lim: self.pkg_lim.upgrade()?,
+            gpu_w: self.gpu_w.upgrade()?,
+            tgp: self.tgp.upgrade()?,
+        })
+    }
+}
+
+fn refresh_stats(l: &StatsLabels) {
+    let Some(s) = get_temps() else { return };
+    let temp = |t: Option<f32>| t.map(|v| format!("{:.1} °C", v)).unwrap_or_else(|| "--".into());
+    let watts = |w: Option<f32>| w.map(|v| format!("{:.1} W", v)).unwrap_or_else(|| "--".into());
+    let rpm = |r: Option<u16>| r.map(|v| format!("{} RPM", v)).unwrap_or_else(|| "--".into());
+    let limits = |a: Option<u32>, b: Option<u32>| match (a, b) {
+        (Some(a), Some(b)) => format!("{} W / {} W", a, b),
+        _ => "--".into(),
+    };
+    let tgp = |t: Option<u32>| t.map(|v| format!("{} W", v)).unwrap_or_else(|| "--".into());
+
+    l.cpu_temp.set_text(&temp(s.cpu_c));
+    l.gpu_temp.set_text(&temp(s.gpu_c));
+    l.cur_rpm.set_text(&rpm(s.current_rpm));
+    l.tgt_rpm.set_text(&format!("{} RPM", s.target_rpm));
+    l.pkg_w.set_text(&watts(s.pkg_watts));
+    l.pkg_lim.set_text(&limits(s.pkg_pl1_w, s.pkg_pl2_w));
+    l.gpu_w.set_text(&watts(s.gpu_watts));
+    l.tgp.set_text(&tgp(s.gpu_tgp_w));
 }
 
 fn make_general_page() -> SettingsPage {
