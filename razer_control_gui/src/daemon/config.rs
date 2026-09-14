@@ -5,6 +5,24 @@ use std::io::prelude::*;
 const SETTINGS_FILE: &str = "/.local/share/razercontrol/daemon.json";
 const EFFECTS_FILE: &str = "/.local/share/razercontrol/effects.json";
 
+/// Write via temp file + fsync + rename so a power cut mid-write can't leave a
+/// truncated file (which would make the daemon fall back to default settings).
+fn write_atomic(path: String, data: &[u8]) -> io::Result<()> {
+    let tmp = format!("{}.tmp", path);
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize, Copy, Clone)]
 pub struct PowerConfig {
     pub power_mode: u8,
@@ -54,7 +72,7 @@ impl Configuration {
 
     pub fn write_to_file(&mut self) -> io::Result<()> {
         let j: String = serde_json::to_string_pretty(&self)?;
-        File::create(get_home_directory() + SETTINGS_FILE)?.write_all(j.as_bytes())?;
+        write_atomic(get_home_directory() + SETTINGS_FILE, j.as_bytes())?;
         Ok(())
     }
 
@@ -66,7 +84,7 @@ impl Configuration {
 
     pub fn write_effects_save(json: serde_json::Value) -> io::Result<()> {
         let j: String = serde_json::to_string_pretty(&json)?;
-        File::create(get_home_directory() + EFFECTS_FILE)?.write_all(j.as_bytes())?;
+        write_atomic(get_home_directory() + EFFECTS_FILE, j.as_bytes())?;
         Ok(())
     }
 
