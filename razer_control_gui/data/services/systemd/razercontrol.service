@@ -1,9 +1,15 @@
 [Unit]
 Description=Razer laptop control daemon
+# Stop retrying if it keeps failing (e.g. no supported device found).
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=/usr/share/razercontrol/daemon
+# If the daemon dies, the EC keeps the last manual fan speed and nothing can change it.
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=default.target
