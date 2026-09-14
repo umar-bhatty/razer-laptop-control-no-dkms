@@ -488,6 +488,13 @@ impl DeviceManager {
         return self.device.as_mut();
     }
 
+    pub fn get_fan_tach(&mut self) -> (i32, i32) {
+        if let Some(laptop) = self.get_device() {
+            return (laptop.get_fan_tach(0x01), laptop.get_fan_tach(0x02));
+        }
+        return (-1, -1);
+    }
+
     pub fn set_bho_handler(&mut self, is_on: bool, threshold: u8) -> bool {
         return self.get_device()
             .map_or(false, |laptop| laptop.set_bho(is_on, threshold));
@@ -805,8 +812,9 @@ impl RazerLaptop {
 
     fn set_rpm(&mut self, zone: u8) -> bool {
         let mut report:RazerPacket = RazerPacket::new(0x0d, 0x01, 0x03);
-        // Set fan RPM
-        report.args[0] = 0x00;
+        // Set fan RPM. args[0] must be 0x01: with 0x00 the EC echoes the setpoint but
+        // doesn't settle there (measured 4000 RPM for a 5000 setpoint on Blade 15 2022).
+        report.args[0] = 0x01;
         report.args[1] = zone;
         report.args[2] = self.fan_rpm;
         if let Some(_) = self.send_report(report) {
@@ -840,6 +848,17 @@ impl RazerLaptop {
     pub fn get_fan_rpm(&mut self) -> u16 {
         let res: u16 = self.fan_rpm as u16;
         return res * 100;
+    }
+
+    /// Measured fan speed from the EC tachometer for zone 1 or 2, or -1 if the read failed.
+    pub fn get_fan_tach(&mut self, zone: u8) -> i32 {
+        let mut report: RazerPacket = RazerPacket::new(0x0d, 0x88, 0x04);
+        report.args[0] = 0x00;
+        report.args[1] = zone;
+        if let Some(response) = self.send_report(report) {
+            return response.args[2] as i32 * 100;
+        }
+        return -1;
     }
 
     pub fn set_logo_led_state(&mut self, mode: u8) -> bool {

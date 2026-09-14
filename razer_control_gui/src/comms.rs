@@ -26,7 +26,8 @@ pub enum DaemonCommand {
     GetSync (),
     SetBatteryHealthOptimizer { is_on: bool, threshold: u8 },
     GetBatteryHealthOptimizer (),
-    GetDeviceName 
+    GetDeviceName,
+    GetFanTach,                                // Measured fan RPM (tachometer), appended to keep indices stable
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -51,7 +52,8 @@ pub enum DaemonResponse {
     GetSync { sync: bool },
     SetBatteryHealthOptimizer { result: bool },
     GetBatteryHealthOptimizer { is_on: bool, threshold: u8 },
-    GetDeviceName { name: String }
+    GetDeviceName { name: String },
+    GetFanTach { rpm1: i32, rpm2: i32 },            // -1 = read failed for that zone
 }
 
 #[allow(dead_code)]

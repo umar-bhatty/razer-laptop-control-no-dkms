@@ -44,7 +44,7 @@ install() {
         fi
         cp target/release/daemon /usr/share/razercontrol/
         cp data/devices/laptops.json /usr/share/razercontrol/
-        cp data/udev/99-hidraw-permissions.rules /etc/udev/rules.d/
+        cp data/udev/70-razer-hidraw-permissions.rules /etc/udev/rules.d/
         udevadm control --reload-rules
 EOF
 
@@ -85,7 +85,7 @@ uninstall() {
         rm -f /usr/share/applications/razer-settings.desktop
         rm -f /usr/share/razercontrol/daemon
         rm -f /usr/share/razercontrol/laptops.json
-        rm -f /etc/udev/rules.d/99-hidraw-permissions.rules
+        rm -f /etc/udev/rules.d/70-razer-hidraw-permissions.rules
         udevadm control --reload-rules
 EOF
 

@@ -59,6 +59,8 @@ enum ReadAttr {
     Sync,
     /// Read the current bho mode
     Bho,
+    /// Read the measured fan speed (tachometer)
+    Tach,
 }
 
 #[derive(Subcommand)]
@@ -284,6 +286,7 @@ fn main() {
             ReadAttr::Logo(AcStateParam { ac_state }) => read_logo_mode(ac_state as usize),
             ReadAttr::Sync => read_sync(),
             ReadAttr::Bho => read_bho(),
+            ReadAttr::Tach => read_fan_tach(),
         },
         Args::Write { attr } => match attr {
             WriteAttr::Fan(FanParams { ac_state, speed }) => {
@@ -551,6 +554,17 @@ fn read_fan_rpm(ac: usize) {
                 _ => format!("{} RPM", rpm),
             };
             println!("Current fan setting: {}", rpm_desc);
+        },
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("Unknown daemon error!"),
+    }
+}
+
+fn read_fan_tach() {
+    match send_data(comms::DaemonCommand::GetFanTach) {
+        Some(comms::DaemonResponse::GetFanTach { rpm1, rpm2 }) => {
+            let desc = |rpm: i32| if rpm < 0 { String::from("Unknown") } else { format!("{} RPM", rpm) };
+            println!("Measured fan speed: fan 1 {}, fan 2 {}", desc(rpm1), desc(rpm2));
         },
         Some(_) => eprintln!("Daemon responded with invalid data!"),
         None => eprintln!("Unknown daemon error!"),

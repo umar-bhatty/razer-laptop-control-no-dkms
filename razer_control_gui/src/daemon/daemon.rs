@@ -406,6 +406,10 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 };
                 return Some(comms::DaemonResponse::GetDeviceName { name });
             }
+            comms::DaemonCommand::GetFanTach => {
+                let (rpm1, rpm2) = d.get_fan_tach();
+                return Some(comms::DaemonResponse::GetFanTach { rpm1, rpm2 });
+            }
 
         };
     } else {
